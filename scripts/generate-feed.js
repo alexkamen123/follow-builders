@@ -16,6 +16,17 @@
 import { readFile, writeFile } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
+import { ProxyAgent, setGlobalDispatcher } from "undici";
+
+// Node's bare fetch() does NOT read HTTPS_PROXY/HTTP_PROXY env vars on its
+// own — without this, requests to anthropic.com/claude.com go direct and
+// are flaky in restricted network environments (observed: 1 in 4 timeouts).
+// Explicitly wiring a ProxyAgent as the global dispatcher fixes this for
+// every fetch() call in this file.
+const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+if (proxyUrl) {
+  setGlobalDispatcher(new ProxyAgent(proxyUrl));
+}
 
 // -- Constants ---------------------------------------------------------------
 
@@ -641,7 +652,69 @@ async function fetchXContent(xAccounts, bearerToken, state, errors) {
 function parseAnthropicEngineeringIndex(html) {
   const articles = [];
 
+  // Strategy 0: anthropic.com/engineering now renders via Next.js App Router,
+  // which streams page data as RSC "flight" payloads embedded in
+  // `self.__next_f.push([1, "..."])` calls rather than a single
+  // __NEXT_DATA__ script tag (Strategy 1 below, kept as a fallback in case
+  // the site reverts to Pages Router). The article list is typically split
+  // across multiple push() chunks, so we must concatenate all of them
+  // (in document order) before locating article records — matching only
+  // the first chunk silently drops articles. Each push() argument is a
+  // JSON string literal (e.g. "..."), so JSON.parse() on the literal itself
+  // handles un-escaping (the payload contains backslash-escaped quotes)
+  // without needing a hand-rolled unescape regex.
+  //
+  // We deliberately do NOT attempt to fully JSON.parse the flight payload —
+  // RSC flight format includes non-JSON reference tokens like `$L15` that
+  // make it a moving target to parse structurally. Instead we split the
+  // concatenated string on the `"_type":"engineeringArticle"` marker that
+  // begins each article record, then extract publishedOn/slug/title from
+  // within each per-article chunk. Scoping the regexes to each chunk (rather
+  // than doing one non-greedy scan across the whole payload) makes this
+  // immune to field ordering and to unrelated fields appearing in between.
+  try {
+    const pushRegex = /self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)/g;
+    let pushMatch;
+    let flight = "";
+    while ((pushMatch = pushRegex.exec(html)) !== null) {
+      flight += JSON.parse(pushMatch[1]);
+    }
+
+    if (flight) {
+      const chunks = flight.split('"_type":"engineeringArticle"');
+      // chunks[0] is content before the first article marker; real article
+      // data lives in chunks[1..].
+      for (let i = 1; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const slugMatch = chunk.match(/"slug":\{[^}]*?"current":"([^"]+)"/);
+        const dateMatch = chunk.match(/"publishedOn":"([^"]+)"/);
+        const titleMatch = chunk.match(/"title":"((?:[^"\\]|\\.)*)"/);
+        if (!slugMatch) continue; // no slug = can't build a URL, skip
+        const slug = slugMatch[1];
+        let title = "Untitled";
+        if (titleMatch) {
+          try {
+            title = JSON.parse(`"${titleMatch[1]}"`);
+          } catch {
+            title = titleMatch[1];
+          }
+        }
+        articles.push({
+          title,
+          url: `https://www.anthropic.com/engineering/${slug}`,
+          publishedAt: dateMatch ? dateMatch[1] : null,
+          description: "",
+        });
+      }
+      if (articles.length > 0) return articles;
+    }
+  } catch {
+    // RSC parsing failed entirely, fall through to older strategies
+  }
+
   // Strategy 1: Look for article data in Next.js __NEXT_DATA__ script tag
+  // (Pages Router format — kept as a fallback; currently unused by the live
+  // site but cheap to keep in case Anthropic reverts the router.)
   const nextDataMatch = html.match(
     /<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i,
   );
@@ -970,7 +1043,32 @@ async function fetchBlogContent(blogs, state, errors) {
     }
   }
 
-  return results;
+  // Step 4: Drop any article whose published date is still unknown after
+  // full-content extraction. This MUST run here — after per-article
+  // enrichment — and not during index parsing (Step 1/2 above), because
+  // claude.com/blog's index page carries zero dates; its articles only get
+  // a real publishedAt once extractClaudeBlogArticleContent() reads the
+  // JSON-LD on the article page itself. Filtering at index time would wipe
+  // out every Claude Blog post before it ever got a chance to be dated.
+  //
+  // Previously, unknown dates were treated as "assume fresh" (passed
+  // through), which is exactly how a months-old article slipped into the
+  // feed as if it were new (the index-page date parser silently failing).
+  // Now unknown dates are excluded outright, and each drop is logged so a
+  // renewed parsing failure shows up as a wave of "no date" errors instead
+  // of silently leaking stale content.
+  const dated = [];
+  let droppedNoDate = 0;
+  for (const article of results) {
+    if (!article.publishedAt) {
+      droppedNoDate++;
+      errors.push(`Blog: dropped ${article.url} (no date)`);
+      continue;
+    }
+    dated.push(article);
+  }
+
+  return { articles: dated, droppedNoDate };
 }
 
 // -- Main --------------------------------------------------------------------
@@ -1065,14 +1163,28 @@ async function main() {
   // Fetch blog posts
   if (runBlogs && sources.blogs && sources.blogs.length > 0) {
     console.error("Fetching blog content...");
-    const blogContent = await fetchBlogContent(sources.blogs, state, errors);
+    const { articles: blogContent, droppedNoDate } = await fetchBlogContent(
+      sources.blogs,
+      state,
+      errors,
+    );
     console.error(`  Found ${blogContent.length} new blog post(s)`);
+
+    // If every candidate got filtered out (e.g. the RSC/JSON-LD date parser
+    // breaks again in the future), fail loudly here rather than silently
+    // writing an empty feed — this is the signal that lets the downstream
+    // runner decide whether to alert instead of just going quiet.
+    if (blogContent.length === 0) {
+      console.error(
+        `Blog: ZERO posts after date filter (dropped=${droppedNoDate})`,
+      );
+    }
 
     const blogFeed = {
       generatedAt: new Date().toISOString(),
       lookbackHours: BLOG_LOOKBACK_HOURS,
       blogs: blogContent,
-      stats: { blogPosts: blogContent.length },
+      stats: { blogPosts: blogContent.length, droppedNoDate },
       errors:
         errors.filter((e) => e.startsWith("Blog")).length > 0
           ? errors.filter((e) => e.startsWith("Blog"))
